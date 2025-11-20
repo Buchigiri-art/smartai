@@ -1,6 +1,7 @@
 // routes/quiz.js
 const express = require('express');
 const crypto = require('crypto');
+const ExcelJS = require('exceljs');
 const Quiz = require('../models/Quiz');
 const QuizAttempt = require('../models/QuizAttempt');
 const emailService = require('../services/emailService');
@@ -84,6 +85,94 @@ router.get('/:id/results', protect, async (req, res) => {
   } catch (error) {
     console.error(`GET /${req.params.id}/results error:`, error);
     res.status(500).json({ message: error.message || 'Failed to fetch attempts' });
+  }
+});
+
+/**
+ * GET /api/quiz/:id/results/download
+ * Download results as an Excel file (summary or detailed)
+ * Query: ?detailed=true
+ */
+router.get('/:id/results/download', protect, async (req, res) => {
+  try {
+    const quizId = req.params.id;
+    const detailed = String(req.query.detailed || 'false').toLowerCase() === 'true';
+
+    // fetch quiz and attempts (teacher-only)
+    const quiz = await Quiz.findOne({ _id: quizId, userId: req.user._id }).lean();
+    if (!quiz) return res.status(404).json({ message: 'Quiz not found' });
+
+    const attempts = await QuizAttempt.find({ quizId: quizId, teacherId: req.user._id })
+      .sort('-submittedAt')
+      .lean();
+
+    // build workbook
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet('Results');
+
+    // Header row
+    const header = [
+      { header: 'Student Name', key: 'studentName', width: 30 },
+      { header: 'USN', key: 'studentUSN', width: 18 },
+      { header: 'Email', key: 'studentEmail', width: 30 },
+      { header: 'Branch', key: 'studentBranch', width: 18 },
+      { header: 'Year', key: 'studentYear', width: 10 },
+      { header: 'Semester', key: 'studentSemester', width: 10 },
+      { header: 'Total Marks', key: 'totalMarks', width: 14 },
+      { header: 'Max Marks', key: 'maxMarks', width: 12 },
+      { header: 'Percentage', key: 'percentage', width: 12 },
+      { header: 'Status', key: 'status', width: 12 },
+      { header: 'Submitted At', key: 'submittedAt', width: 22 }
+    ];
+
+    // If detailed, add columns for question-by-question (if quiz.questions exists)
+    if (detailed && Array.isArray(quiz.questions) && quiz.questions.length > 0) {
+      quiz.questions.forEach((q, idx) => {
+        header.push({ header: `Q${idx + 1}`, key: `q_${idx + 1}`, width: 18 });
+      });
+    }
+
+    sheet.columns = header;
+
+    // Rows
+    for (const a of attempts) {
+      const row = {
+        studentName: a.studentName || '',
+        studentUSN: a.studentUSN || '',
+        studentEmail: a.studentEmail || '',
+        studentBranch: a.studentBranch || '',
+        studentYear: a.studentYear || '',
+        studentSemester: a.studentSemester || '',
+        totalMarks: (a.totalMarks !== undefined && a.totalMarks !== null) ? a.totalMarks : '',
+        maxMarks: (a.maxMarks !== undefined && a.maxMarks !== null) ? a.maxMarks : '',
+        percentage: (a.percentage !== undefined && a.percentage !== null) ? a.percentage : '',
+        status: a.status || '',
+        submittedAt: a.submittedAt ? new Date(a.submittedAt).toLocaleString() : ''
+      };
+
+      if (detailed && Array.isArray(a.answers)) {
+        for (let i = 0; i < quiz.questions.length; i++) {
+          const ans = (a.answers && a.answers[i]) ? a.answers[i].studentAnswer : '';
+          row[`q_${i + 1}`] = ans;
+        }
+      }
+
+      sheet.addRow(row);
+    }
+
+    // set response headers to download
+    const safeTitle = (quiz.title || 'quiz').replace(/[^a-z0-9]/gi, '_').toLowerCase();
+    const filename = `${safeTitle}_results${detailed ? '_detailed' : ''}.xlsx`;
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // stream workbook to response
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error('GET /:id/results/download error:', err);
+    return res.status(500).json({ message: err.message || 'Failed to generate Excel' });
   }
 });
 
