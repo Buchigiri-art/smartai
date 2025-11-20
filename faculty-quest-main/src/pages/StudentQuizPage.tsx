@@ -10,11 +10,11 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
 import { Textarea } from '@/components/ui/textarea';
 import { Progress } from '@/components/ui/progress';
 import { toast } from '@/components/ui/use-toast';
-import { Loader2, Clock, CheckCircle2, AlertCircle } from 'lucide-react';
+import { Loader2, Clock, CheckCircle2, AlertCircle, Maximize2 } from 'lucide-react';
 import axios from 'axios';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
-const MAX_WARNINGS = 3; // block on 3rd warning
+const MAX_WARNINGS = 3; // server-side threshold still honored; client auto-submits immediately
 
 interface Question {
   id: string;
@@ -62,15 +62,18 @@ export default function StudentQuizPage() {
   const localWarningsRef = useRef<number>(0);
   const lastWarnAtRef = useRef<number>(0);
   const tokenRef = useRef<string | undefined>(token);
-  const fullscreenRetryRef = useRef<number>(0);
   const monitoringRef = useRef<boolean>(false);
+
+  // Keep refs so handlers can call auto-submit safely
+  const attemptIdRef = useRef<string>('');
+  attemptIdRef.current = attemptId;
 
   useEffect(() => {
     tokenRef.current = token;
     fetchQuizData();
-    // cleanup on unmount
     return () => {
       removeMonitoringListeners();
+      restoreBodyStyles();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
@@ -119,7 +122,6 @@ export default function StudentQuizPage() {
         setTimeLeft((data.quiz.duration || 30) * 60);
         setStudentName(data.studentInfo.name);
         setStudentUSN(data.studentInfo.usn);
-        // enable monitoring because quiz was already started
         enableMonitoring();
       } else {
         setShowInfoForm(true);
@@ -159,19 +161,21 @@ export default function StudentQuizPage() {
       });
 
       setAttemptId(res.data.attemptId);
-      setQuiz(res.data.quiz);
       setAnswers(new Array(res.data.quiz.questions.length).fill(''));
       setTimeLeft((res.data.quiz.duration || 30) * 60);
       setQuizStarted(true);
       setShowInfoForm(false);
 
-      // Attempt to go fullscreen and start monitoring
-      await tryEnterFullscreen(3, 500);
+      // apply strict body styles (disable selection etc)
+      applyBodyStyles();
+
+      // Attempt to go fullscreen (may be blocked) and start monitoring
+      await tryEnterFullscreen(3, 300);
       enableMonitoring();
 
       toast({
         title: 'Quiz Started',
-        description: 'Quiz is being monitored. Stay in fullscreen and on this tab.',
+        description: 'Quiz is being strictly monitored. Any violation will auto-submit the quiz.',
       });
     } catch (err: any) {
       console.error('Error starting quiz:', err);
@@ -192,11 +196,12 @@ export default function StudentQuizPage() {
     setSubmitting(true);
     try {
       const res = await axios.post(`${API_URL}/student-quiz/attempt/submit`, {
-        attemptId,
+        attemptId: attemptIdRef.current || attemptId,
         answers,
       });
 
       removeMonitoringListeners();
+      restoreBodyStyles();
       setQuizSubmitted(true);
       toast({
         title: 'Quiz Submitted',
@@ -213,6 +218,36 @@ export default function StudentQuizPage() {
     }
   };
 
+  // Auto-submit as cheat immediately (strict)
+  const handleAutoSubmitAsCheat = async (reason = 'violation:auto-submit') => {
+    if (quizSubmitted) return;
+    try {
+      // Attempt to flag server (best-effort)
+      await axios.post(`${API_URL}/student-quiz/attempt/flag`, { token, reason });
+    } catch (err) {
+      console.warn('Flagging failed during auto-submit:', err);
+    } finally {
+      setIsCheated(true);
+      // Submit immediately as stolen/cheated attempt
+      try {
+        await axios.post(`${API_URL}/student-quiz/attempt/submit`, {
+          attemptId: attemptIdRef.current || attemptId,
+          answers,
+        });
+      } catch (err) {
+        console.warn('Auto-submit failed:', err);
+      }
+      removeMonitoringListeners();
+      restoreBodyStyles();
+      setQuizSubmitted(true);
+      toast({
+        title: 'Quiz Blocked',
+        description: 'A violation was detected and the quiz was auto-submitted as cheated.',
+        variant: 'destructive',
+      });
+    }
+  };
+
   const handleAnswerChange = (value: string) => {
     const newAnswers = [...answers];
     newAnswers[currentQuestion] = value;
@@ -220,11 +255,8 @@ export default function StudentQuizPage() {
   };
 
   // ----------------- FULLSCREEN HELPERS -----------------
-  // Try to enter fullscreen up to retries times, waiting delayMs between tries.
-  const tryEnterFullscreen = async (retries = 3, delayMs = 300) => {
-    fullscreenRetryRef.current = 0;
+  const tryEnterFullscreen = async (retries = 3, delayMs = 300): Promise<boolean> => {
     const attemptFS = async (): Promise<boolean> => {
-      fullscreenRetryRef.current++;
       try {
         if (document.fullscreenElement) return true;
         if ((document.documentElement as any).requestFullscreen) {
@@ -234,9 +266,7 @@ export default function StudentQuizPage() {
           await (document.documentElement as any).webkitRequestFullscreen();
           return !!document.fullscreenElement;
         }
-      } catch (err) {
-        // ignored - likely blocked by browser
-      }
+      } catch (err) {}
       return false;
     };
 
@@ -245,155 +275,198 @@ export default function StudentQuizPage() {
       if (ok) return true;
       await new Promise((r) => setTimeout(r, delayMs));
     }
-
-    // If we reach here, fullscreen failed
-    toast({
-      title: 'Enter fullscreen',
-      description: 'Please press F11 (or use browser fullscreen) to maximize your test window. We attempted automatically but the browser blocked it.',
-      variant: 'default',
-    });
     return false;
   };
 
-  // ----------------- MONITORING LISTENERS -----------------
+  // ----------------- STRICT MONITORING -----------------
   const enableMonitoring = () => {
     if (monitoringRef.current) return;
     monitoringRef.current = true;
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    window.addEventListener('blur', onWindowBlur);
-    document.addEventListener('fullscreenchange', onFullscreenChange);
-    window.addEventListener('copy', onCopyAttempt);
-    window.addEventListener('beforeunload', onBeforeUnload);
+
+    document.addEventListener('visibilitychange', onVisibilityChange, true);
+    window.addEventListener('blur', onWindowBlur, true);
+    document.addEventListener('fullscreenchange', onFullscreenChange, true);
+    window.addEventListener('copy', onCopyAttempt, true);
+    window.addEventListener('beforeunload', onBeforeUnload, true);
+
+    // Prevent right-click and inspect shortcuts
+    document.addEventListener('contextmenu', onContextMenu, true);
+    window.addEventListener('keydown', onKeyDown, true);
+
+    // Optional: prevent touch-hold context menu on some browsers
+    document.addEventListener('touchstart', onTouchStart, { passive: false });
+
+    // Disable selection/touch callouts (applied on start as well)
+    applyBodyStyles();
   };
 
   const removeMonitoringListeners = () => {
     monitoringRef.current = false;
-    document.removeEventListener('visibilitychange', onVisibilityChange);
-    window.removeEventListener('blur', onWindowBlur);
-    document.removeEventListener('fullscreenchange', onFullscreenChange);
-    window.removeEventListener('copy', onCopyAttempt);
-    window.removeEventListener('beforeunload', onBeforeUnload);
+
+    document.removeEventListener('visibilitychange', onVisibilityChange, true);
+    window.removeEventListener('blur', onWindowBlur, true);
+    document.removeEventListener('fullscreenchange', onFullscreenChange, true);
+    window.removeEventListener('copy', onCopyAttempt, true);
+    window.removeEventListener('beforeunload', onBeforeUnload, true);
+
+    document.removeEventListener('contextmenu', onContextMenu, true);
+    window.removeEventListener('keydown', onKeyDown, true);
+    document.removeEventListener('touchstart', onTouchStart as EventListener);
   };
 
-  // Throttle sending flags (ignore repeats within 800ms)
+  // Throttle flag sends slightly to avoid flooding (but we auto-submit immediately anyway)
   const sendFlag = async (reason: string) => {
     const now = Date.now();
-    if (now - (lastWarnAtRef.current || 0) < 800) return;
+    if (now - (lastWarnAtRef.current || 0) < 500) return;
     lastWarnAtRef.current = now;
 
-    // increment local immediately for snappier UI
+    // increment local count for UI
     localWarningsRef.current = localWarningsRef.current + 1;
     setWarningCount(localWarningsRef.current);
 
-    // Attempt to re-enter fullscreen quickly
-    tryEnterFullscreen(2, 300);
-
-    // Notify server
     try {
-      const res = await axios.post(`${API_URL}/student-quiz/attempt/flag`, { token, reason });
-      const data = res.data;
-      const serverCount = data.warningCount ?? localWarningsRef.current;
-      localWarningsRef.current = serverCount;
-      setWarningCount(serverCount);
-
-      // If server says autoSubmitted, treat it as blocked:
-      if (data.autoSubmitted || serverCount >= MAX_WARNINGS) {
-        // block UI
-        setIsCheated(true);
-        setQuizSubmitted(true);
-        removeMonitoringListeners();
-
-        toast({
-          title: 'Quiz blocked',
-          description: 'Repeated violations detected. The quiz has been blocked and submitted.',
-          variant: 'destructive',
-        });
-
-        return;
-      }
-
-      const remaining = Math.max(0, MAX_WARNINGS - serverCount);
-      toast({
-        title: 'Focus change detected',
-        description: `Warning ${serverCount}/${MAX_WARNINGS}. ${remaining} warning(s) until quiz is blocked.`,
-        variant: 'default',
-      });
+      await axios.post(`${API_URL}/student-quiz/attempt/flag`, { token, reason });
     } catch (err) {
-      // Server unavailable — use local count fallback
-      console.error('Flagging failed:', err);
-      const serverCount = localWarningsRef.current;
-      if (serverCount >= MAX_WARNINGS) {
-        setIsCheated(true);
-        setQuizSubmitted(true);
-        removeMonitoringListeners();
-        toast({
-          title: 'Quiz blocked (local)',
-          description: 'Multiple violations recorded locally. Quiz blocked.',
-          variant: 'destructive',
-        });
-        } else {
-        const remaining = Math.max(0, MAX_WARNINGS - serverCount);
-        toast({
-          title: 'Focus change detected (offline)',
-          description: `Warning ${serverCount}/${MAX_WARNINGS}. ${remaining} warning(s) until quiz is blocked.`,
-          variant: 'default',
-        });
-      }
+      console.warn('Flag send failed:', err);
     }
   };
 
-  // Event handlers
+  // Event handlers: all these trigger strict auto-submit
   const onVisibilityChange = () => {
     if (document.hidden || document.visibilityState !== 'visible') {
-      // Tab hidden or minimized
+      // immediate strict response
       sendFlag('visibility:hidden');
+      handleAutoSubmitAsCheat('visibility:hidden');
     }
   };
 
   const onWindowBlur = () => {
     sendFlag('window:blur');
+    handleAutoSubmitAsCheat('window:blur');
   };
 
   const onFullscreenChange = () => {
     const isFs = !!document.fullscreenElement;
     if (!isFs) {
-      // exited fullscreen
-      // try to re-enter; then flag
-      tryEnterFullscreen(2, 300).then((entered) => {
-        if (!entered) {
-          // couldn't re-enter fullscreen -> flag & warn
-          sendFlag('fullscreen:exited');
-        } else {
-          // re-entered ok - still count as minor violation? up to you — here we still warn once
-          sendFlag('fullscreen:reentered');
-        }
-      });
+      sendFlag('fullscreen:exited');
+      handleAutoSubmitAsCheat('fullscreen:exited');
     }
   };
 
   const onCopyAttempt = (e: ClipboardEvent) => {
     if (quizStarted && !quizSubmitted) {
-      // log copy attempt
       sendFlag('clipboard:copy');
+      handleAutoSubmitAsCheat('clipboard:copy');
     }
   };
 
   const onBeforeUnload = (e: BeforeUnloadEvent) => {
     if (quizStarted && !quizSubmitted) {
-      // show native confirm (some browsers respect)
+      try {
+        // best effort flag
+        sendFlag('attempt:beforeunload');
+      } catch (err) {}
+      // auto-submit immediately (best-effort)
+      handleAutoSubmitAsCheat('attempt:beforeunload');
+      // show browser prompt (optional)
       e.preventDefault();
       e.returnValue = '';
-      // and flag server (non-blocking)
-      sendFlag('attempt:beforeunload');
     }
   };
 
-  // Render helpers
+  // Disable context menu (right-click)
+  const onContextMenu = (e: Event) => {
+    e.preventDefault();
+    sendFlag('contextmenu:block');
+    handleAutoSubmitAsCheat('contextmenu:block');
+  };
+
+  // Prevent inspect/shortcut keys
+  const onKeyDown = (e: KeyboardEvent) => {
+    // List of key combos to block: F12, Ctrl+Shift+I/C/J, Ctrl+U, Ctrl+S, Ctrl+Shift+C, Cmd variants
+    const key = e.key?.toLowerCase();
+    const ctrl = e.ctrlKey || e.metaKey; // metaKey covers Cmd on mac
+    const shift = e.shiftKey;
+
+    if (key === 'f12') {
+      e.preventDefault();
+      sendFlag('key:f12');
+      handleAutoSubmitAsCheat('key:f12');
+    }
+
+    if (ctrl && shift && (key === 'i' || key === 'c' || key === 'j')) {
+      e.preventDefault();
+      sendFlag(`key:ctrl-shift-${key}`);
+      handleAutoSubmitAsCheat(`key:ctrl-shift-${key}`);
+    }
+
+    if (ctrl && key === 'u') {
+      e.preventDefault();
+      sendFlag('key:ctrl-u');
+      handleAutoSubmitAsCheat('key:ctrl-u');
+    }
+
+    if (ctrl && key === 's') {
+      e.preventDefault();
+      sendFlag('key:ctrl-s');
+      handleAutoSubmitAsCheat('key:ctrl-s');
+    }
+  };
+
+  // Prevent long-press context on mobile (best-effort)
+  const onTouchStart = (e: TouchEvent) => {
+    // Prevent default to avoid touch-callout on some browsers (may interfere with scrolling)
+    if (quizStarted && !quizSubmitted) {
+      e.preventDefault();
+    }
+  };
+
+  // ----------------- BODY STYLE HELPERS (disable selection / touch callout) -----------------
+  const applyBodyStyles = () => {
+    try {
+      const body = document.body;
+      // Save previous values to data attributes for restoration
+      if (!body.dataset.prevUserSelect) body.dataset.prevUserSelect = body.style.userSelect || '';
+      if (!body.dataset.prevWebkitTouchCallout) body.dataset.prevWebkitTouchCallout = body.style.webkitTouchCallout || '';
+      if (!body.dataset.prevTouchAction) body.dataset.prevTouchAction = body.style.touchAction || '';
+
+      body.style.userSelect = 'none';
+      // @ts-ignore
+      body.style.webkitTouchCallout = 'none';
+      body.style.touchAction = 'manipulation';
+    } catch (err) {
+      // ignore
+    }
+  };
+
+  const restoreBodyStyles = () => {
+    try {
+      const body = document.body;
+      if (body.dataset.prevUserSelect !== undefined) body.style.userSelect = body.dataset.prevUserSelect;
+      if (body.dataset.prevWebkitTouchCallout !== undefined) {
+        // @ts-ignore
+        body.style.webkitTouchCallout = body.dataset.prevWebkitTouchCallout;
+      }
+      if (body.dataset.prevTouchAction !== undefined) body.style.touchAction = body.dataset.prevTouchAction;
+
+      delete body.dataset.prevUserSelect;
+      delete body.dataset.prevWebkitTouchCallout;
+      delete body.dataset.prevTouchAction;
+    } catch (err) {
+      // ignore
+    }
+  };
+
+  // ----------------- RENDER HELPERS -----------------
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   };
+
+  function isMobileDevice() {
+    return /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+  }
 
   // UI: loading
   if (loading) {
@@ -418,7 +491,7 @@ export default function StudentQuizPage() {
             <CardTitle>{isCheated ? 'Quiz Blocked' : 'Quiz Submitted'}</CardTitle>
             <CardDescription>
               {isCheated
-                ? 'Your quiz was blocked due to repeated fullscreen/tab-switch violations. Contact the instructor if this is in error.'
+                ? 'Your quiz was blocked due to violations. Contact the instructor if this is in error.'
                 : 'Thank you — your quiz has been submitted.'}
             </CardDescription>
           </CardHeader>
@@ -493,7 +566,7 @@ export default function StudentQuizPage() {
 
             <div>
               <p className="text-sm text-muted-foreground">
-                This quiz will monitor focus changes. If you switch tabs, minimize, or exit fullscreen {MAX_WARNINGS} times, the quiz will be blocked.
+                Strict monitoring is enabled. Any tab-switch, minimize, fullscreen exit, copy, right-click, or inspect attempt will automatically submit the quiz and mark it as cheated.
               </p>
             </div>
 
@@ -510,6 +583,7 @@ export default function StudentQuizPage() {
   if (quizStarted && quiz?.questions) {
     const question = quiz.questions[currentQuestion];
     const progress = ((currentQuestion + 1) / quiz.questions.length) * 100;
+    const showFullscreenButton = !document.fullscreenElement;
 
     return (
       <div className="min-h-screen bg-background">
@@ -519,11 +593,21 @@ export default function StudentQuizPage() {
               <div>
                 <h1 className="text-xl font-bold">{quiz.title}</h1>
                 <p className="text-sm text-muted-foreground">{studentName} ({studentUSN})</p>
-                <p className="text-xs text-muted-foreground">Warnings: {warningCount} / {MAX_WARNINGS}</p>
+                <p className="text-xs text-muted-foreground">Warnings recorded: {warningCount}</p>
               </div>
               <div className="flex items-center gap-2 text-lg font-semibold">
                 <Clock className={`h-5 w-5 ${timeLeft < 300 ? 'text-destructive' : 'text-primary'}`} />
                 <span className={timeLeft < 300 ? 'text-destructive' : 'text-foreground'}>{formatTime(timeLeft)}</span>
+                {showFullscreenButton && (
+                  <Button size="sm" variant="outline" onClick={async () => {
+                    const ok = await tryEnterFullscreen(3, 300);
+                    if (!ok) {
+                      toast({ title: 'Fullscreen blocked', description: 'Please allow fullscreen via browser UI.' });
+                    }
+                  }}>
+                    <Maximize2 className="mr-2 h-4 w-4" /> Fullscreen
+                  </Button>
+                )}
               </div>
             </div>
             <div className="space-y-1">
